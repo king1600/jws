@@ -20,62 +20,95 @@ public class WSClient {
   private BiConsumer<Integer, String> closeCallback;
   private BiConsumer<byte[], WSFrame.OpCode> messageCallback;
   
+  /**
+   * Initialize a new WebsocketClient
+   * @param sock the underlying socket
+   */
   public WSClient(final ClientSocket sock) {
     socket = sock;
     reader = new ByteArrayOutputStream();
   }
   
+  /**
+   * Wrap the internal ClientSocket with callback events
+   */
   public void wrap() {
+
+    // after packet write
     socket.setWrite(() -> {
-      if (closed) {
-        socket.close();
-        return;
-      }
+      // close connection if requested
+      if (closed) { socket.close(); return; }
+      // handle connection event after handshake
       if (!handshaked) {
         handshaked = true;
         if (connectionCallback != null)
           connectionCallback.run();
       }
     });
+
+    // after packet read
     socket.setRead(data -> {
       try {
+        // perform initial handshake
         if (!handshaked) {
           handshake(data);
+        
+        // handle websocket frames
         } else {
-          WSFrame frame = parseFrame(data);
+          WSFrame frame = WSFrame.parseFrame(data); // parse frame from data
           lastOpCode = frame.getOpCode() == null ? lastOpCode : frame.getOpCode();
+
+          // non-masked data from client = disconnect
           if (!frame.isMasked()) {
             close(1008);
+
+          // handle CLOSE Events
           } else if (frame.getOpCode() == WSFrame.OpCode.CLOSE) {
             close(frame);
+
+          // handle other types of frames
           } else {
-            reader.write(frame.payload);
-            if (frame.isFin()) {
+            reader.write(frame.payload); // add to internal read buffer
+            if (frame.isFin()) {         // check EOF (End of Frame)
+
+              // handle ping frames
               if (frame.getOpCode() == WSFrame.OpCode.PING) {
                 if (pingCallback != null)
                   pingCallback.accept(frame.payload);
                 send(new WSFrame(true, false, WSFrame.OpCode.PONG, frame.payload));
+
+              // handle pong frames
               } else if (frame.getOpCode() == WSFrame.OpCode.PONG) {
                 if (pongCallback != null)
                   pongCallback.accept(frame.payload);
+
+              // handle data frame (OP_TEXT and OP_BINARY)
               } else {
                if (messageCallback != null)
                  messageCallback.accept(reader.toByteArray(), lastOpCode);
               }
+
+              // on EOF (End of Frame) Reset read buffer
               reader.reset();
             }
           }
         }
+
+      // catch any errors
       } catch (Exception e) {
         error(e);
       }
     });
   }
   
+  /**
+   * return Bad request on invalid handshake with message
+   * @param message the message to include in the HTTP 400 response
+   */
   private void handshakeError(String message) {
     String request = new StringBuilder()
         .append("HTTP/1.1 400 Bad Request\r\n")
-        .append("Server: WSClient\r\n")
+        .append("Server: JWS/0.0.1\r\n")
         .append("Content-Type: text/plain\r\n")
         .append("Content-Length: ")
         .append(Integer.toString(message.length()))
@@ -86,9 +119,16 @@ public class WSClient {
     socket.write(request.getBytes());
   }
   
+  /**
+   * Perform Client handshake.
+   * @param data the initial http request as byte[]
+   */
   private void handshake(byte[] data) throws Exception {
-    String key = null, version = null, extensions = null;
-    List<String> parts = split(new String(data), "\r\n");
+    String key = null, version = null, extensions = null; // websocket items
+    List<String> parts = split(new String(data), "\r\n"); // parsed request
+
+    // iterate through request lines and
+    // get Key, Version and Extensions from Header
     for (int i = 0; i < parts.size(); i++) {
       if (parts.get(i).indexOf("Sec-WebSocket-Key") > -1)
         key = split(parts.get(i),":").get(1).substring(1).trim();
@@ -97,6 +137,8 @@ public class WSClient {
       else if (parts.get(i).indexOf("Sec-WebSocket-Extensions") > -1)
         extensions = split(parts.get(i),":").get(1).substring(1).trim();
     }
+
+    // Check if it valid Websocket Request that server can serve to
     if (key == null) {
       handshakeError("No Sec-WebSocket-Key provided");
     } else if (version == null) {
@@ -106,6 +148,8 @@ public class WSClient {
     } else if (extensions != null) {
       handshakeError("Sec-WebSocket-Extensions not supported");
     } else {
+
+      // request is valid, send back response to complete the handshake
       String request = new StringBuilder()
           .append("HTTP/1.1 101 Switching Protocols\r\n")
           .append("Upgrade: websocket\r\n")
@@ -118,48 +162,12 @@ public class WSClient {
     }
   }
   
-  private WSFrame parseFrame(byte[] data) throws Exception {
-    WSFrame frame = new WSFrame();
-    ByteBuffer buffer = ByteBuffer.wrap(data);
-    
-    // get if finished and opcode
-    byte b = buffer.get();
-    frame.setFin((b & 0x80) != 0);
-    for (int i = 16; i < 65; i *= 16)
-      if ((b & i) != 0)
-        throw new Exception("Reserved Flags must be 0");
-    frame.setOpCode(WSFrame.OpCode.get(b & 0x0f));
-    
-    // get if masked and payload length
-    b = buffer.get();
-    frame.setMasked((b & 0x80) != 0);
-    int payloadLength = (byte)(0x7F & b);
-    int lengthExtend  = 0;
-    if (payloadLength == 0x7F)
-      lengthExtend = 8;
-    else if (payloadLength == 0x7E)
-      lengthExtend = 2;
-    while (--lengthExtend > 0) {
-      b = buffer.get();
-      payloadLength |= (b & 0xFF) << (8 * lengthExtend);
-    }
-    
-    // get masked key and payload
-    byte[] maskedKey = null;
-    if (frame.isMasked()) {
-      maskedKey = new byte[4];
-      buffer.get(maskedKey, 0, maskedKey.length);
-    }
-    frame.payload = new byte[payloadLength];
-    buffer.get(frame.payload, 0, payloadLength);
-    if (frame.isMasked())
-      for (int i = 0; i < payloadLength; i++)
-        frame.payload[i] ^= maskedKey[i % 4];
-    
-    // return parsed frame
-    return frame;
-  }
-  
+  /**
+   * Faster split algorithm than String.split();
+   * @param str the string to split
+   * @param delim the string deliminator to split str by
+   * @return the content split into a dynamic array
+   */
   private List<String> split(String str, final String delim) {
     int index = 0;
     List<String> results = new ArrayList<String>();
@@ -175,69 +183,75 @@ public class WSClient {
     return results;
   }
   
+  /**
+   * Send Binary Data over websocket
+   * @param data the binary data
+   */
   public void send(byte[] data) {
     send(new WSFrame(true, false, WSFrame.OpCode.BINARY, data));
   }
   
+  /**
+   * Send UTF8 Text Data over websocket
+   * @param data the text data
+   */
   public void send(String data) {
     send(new WSFrame(true, false, WSFrame.OpCode.TEXT, data.getBytes(WSFrame.UTF8)));
   }
+
+  /**
+   * Sebd a Websocket frame over network
+   */
+  public void send(final WSFrame frame) {
+    socket.write(frame.toPacket());
+  }
   
+  /**
+   * Send a ping with no payload
+   */
   public void ping() {
     ping(new byte[]{});
   }
   
+  /**
+   * Send a ping with binary payload
+   * @param data the binary payload
+   */
   public void ping(byte[] data) {
     send(new WSFrame(true, false, WSFrame.OpCode.PING, data));
   }
   
+  /**
+   * Send a ping with utf8 text payload
+   * @param data the text payload
+   */
   public void ping(String data) {
     send(new WSFrame(true, false, WSFrame.OpCode.PING, data.getBytes(WSFrame.UTF8)));
   }
   
-  public void send(final WSFrame frame) {
-    int start   = -1;
-    int length  = frame.payload.length;
-    int fin     = (frame.isFin() ? 0x10000000 : 0) | frame.getOpCode().getValue();
-    int mask    = frame.isMasked() ? 0x10000000 : 0;
-    byte[] buffer = new byte[frame.getFinalSize()];
-    buffer[0] = (byte)(fin ^ 0x80);
-    if (length <= 125) {
-      buffer[1] = (byte)((mask | length));
-      start     = 2;
-    } else if (length >= 126 && length <= WSFrame.MAX) {
-      buffer[1] = (byte)((mask | 0x7E));
-      buffer[2] = (byte)((length >> 8) & 0xFF);
-      buffer[3] = (byte)((length     ) & 0xFF);
-      start     = 4;
-    } else {
-      buffer[1] = (byte)((mask | 0x7F));
-      buffer[2] = (byte)((length >> 56) & 0xFF);
-      buffer[3] = (byte)((length >> 48) & 0xFF);
-      buffer[4] = (byte)((length >> 40) & 0xFF);
-      buffer[5] = (byte)((length >> 32) & 0xFF);
-      buffer[6] = (byte)((length >> 24) & 0xFF);
-      buffer[7] = (byte)((length >> 16) & 0xFF);
-      buffer[8] = (byte)((length >> 8) & 0xFF);
-      buffer[9] = (byte)((length     ) & 0xFF);
-      start     = 10;
-    }
-    for (int i = 0; i < length; i++)
-      buffer[start + i] = frame.payload[i];
-    socket.write(buffer);
-  }
-  
+  /**
+   * Perform an error and close the connection
+   * @param e the excetion to handle
+   */
   private void error(final Exception e) {
     if (errorCallback != null)
       errorCallback.accept(e);
     close(1011);
   }
   
+  /**
+   * Closed the websocket connection
+   * @param code the error code to close with
+   */
   public void close(int code) {
     byte[] payload = Integer.toString(code).getBytes(WSFrame.UTF8);
     close(new WSFrame(true, false, WSFrame.OpCode.CLOSE, payload));
   }
   
+  /**
+   * Send the CLOSE websocket Frame and terminate the connection
+   * @param frame the websocket frame to modify and send
+   */
   public void close(final WSFrame frame) {
     frame.setFin(true);
     frame.setOpCode(WSFrame.OpCode.CLOSE);
@@ -250,37 +264,62 @@ public class WSClient {
           closeCallback.accept(code, WSFrame.CLOSE_CODES.get(code));
         else
           closeCallback.accept(code, "");
-      } catch (Exception e) {
-        
-      }
+      } catch (Exception e) {}
     }
   }
   
+  /**
+   * Get the internal ClientSocket of the Websocket client
+   * @return the internal ClientSocket
+   */
   public ClientSocket getSock() {
     return socket;
   }
   
+  /**
+   * Bind CONNECT event to calback
+   * @param callback event to call
+   */
   public void onConnect(Runnable callback) {
     connectionCallback = callback;
   }
   
+  /**
+   * Bind PING event to calback
+   * @param callback event to call
+   */
   public void onPing(Consumer<byte[]> callback) {
     pingCallback = callback;
   }
   
+  /**
+   * Bind PONG event to calback
+   * @param callback event to call
+   */
   public void onPong(Consumer<byte[]> callback) {
     pongCallback = callback;
   }
   
+  /**
+   * Bind ERROR event to calback
+   * @param callback event to call
+   */
   public void onError(Consumer<Exception> callback) {
     errorCallback = callback;
   }
   
+  /**
+   * Bind CLOSE event to calback
+   * @param callback event to call
+   */
   public void onClose(BiConsumer<Integer, String> callback) {
     closeCallback = callback;
   }
   
-  
+  /**
+   * Bind MESSAGE event to calback
+   * @param callback event to call
+   */
   public void onMessage(BiConsumer<byte[], WSFrame.OpCode> callback) {
     messageCallback = callback;
   }
