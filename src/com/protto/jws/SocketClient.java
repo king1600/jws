@@ -86,7 +86,6 @@ public class SocketClient {
   
   private void readAndSpawn(final int amount, final Consumer<byte[]> callback) {
     final byte[] data = readStream.read(amount);
-    callback.accept(data);
     server.getThreadPool().submit(() -> {
       callback.accept(data);
     });
